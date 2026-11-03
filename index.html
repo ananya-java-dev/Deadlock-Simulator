@@ -1,0 +1,204 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OS Deadlock Detection Simulator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.29.2/cytoscape.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ══ TOAST CONTAINER ══ -->
+<div id="toast-container"></div>
+
+<!-- ══ APP HEADER ══ -->
+<header class="app-header">
+  <h1>⚙️ OS Deadlock Detection Simulator</h1>
+  <div class="header-controls">
+    <select id="preset-select" title="Load a preset scenario">
+      <option value="">— Load preset —</option>
+    </select>
+    <button id="btn-detect" class="btn-success">🔍 Detect Deadlock</button>
+    <div class="undo-redo-group">
+      <button id="btn-undo" class="btn-outline btn-sm" disabled title="Undo">↩ Undo <span id="undo-count"></span></button>
+      <button id="btn-redo" class="btn-outline btn-sm" disabled title="Redo">↪ Redo <span id="redo-count"></span></button>
+    </div>
+    <button id="btn-reset" class="btn-danger btn-sm">↺ Reset</button>
+  </div>
+</header>
+
+<!-- ══ MAIN LAYOUT ══ -->
+<div class="app-body">
+
+  <!-- ── Left: Graph ── -->
+  <div class="graph-pane">
+    <div id="graph-container"></div>
+    <div class="graph-toolbar">
+      <button id="btn-fit" class="btn-outline btn-sm">⛶ Fit</button>
+    </div>
+  </div>
+
+  <!-- ── Right: All panels ── -->
+  <div class="right-panel">
+
+    <!-- General error -->
+    <div id="error-general" class="error-msg" style="margin:10px 16px 0;"></div>
+
+    <!-- ── Add Process ── -->
+    <div class="panel-section">
+      <h3>Add Process</h3>
+      <form id="form-add-process" class="form-row" autocomplete="off">
+        <input id="input-pid" type="text" placeholder="ID e.g. P1" maxlength="20" required title="Process ID (no spaces)" />
+        <input id="input-priority" type="number" min="1" step="1" value="1" title="Priority (higher = more important)" style="width:60px" />
+        <label class="field-label" style="color:var(--text-muted);font-size:11px;align-self:center">priority</label>
+        <button type="submit" class="btn-primary btn-sm">+ Process</button>
+      </form>
+      <div id="error-process" class="error-msg"></div>
+    </div>
+
+    <!-- ── Add Resource ── -->
+    <div class="panel-section">
+      <h3>Add Resource</h3>
+      <form id="form-add-resource" class="form-row" autocomplete="off">
+        <input id="input-rid" type="text" placeholder="ID e.g. R1" maxlength="20" required title="Resource ID (no spaces)" />
+        <input id="input-total" type="number" min="1" step="1" value="1" title="Total instances" />
+        <button type="submit" class="btn-primary btn-sm">+ Resource</button>
+      </form>
+      <div id="error-resource" class="error-msg"></div>
+    </div>
+
+    <!-- ── Matrices ── -->
+    <div class="panel-section">
+      <h3>Matrices &amp; Available</h3>
+      <div id="matrix-panel" class="matrix-panel">
+        <p class="empty-hint">Add processes and resources to begin.</p>
+      </div>
+    </div>
+
+    <!-- ── Verdict ── -->
+    <div id="verdict-banner" class="verdict-banner" role="alert"></div>
+
+    <!-- ── Detection Log ── -->
+    <div class="panel-section">
+      <h3>Algorithm Trace</h3>
+      <div id="log-panel" class="log-panel">
+        <p class="empty-hint">Run detection to see the step-by-step trace.</p>
+      </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         PHASE 5: RECOVERY PANEL
+         Enabled only when latest detection = deadlock.
+    ══════════════════════════════════════════════════ -->
+    <div id="recovery-panel" class="panel-section panel-disabled">
+      <h3>🛠 Recovery Techniques</h3>
+      <p class="recovery-hint">Run detection first. Enabled only when a deadlock is detected.</p>
+
+      <!-- Tabs -->
+      <div class="recovery-tabs">
+        <button class="recovery-tab active" id="tab-terminate" data-pane="terminate">⛔ Termination</button>
+        <button class="recovery-tab" id="tab-preempt"   data-pane="preempt">⬇ Preemption</button>
+        <button class="recovery-tab" id="tab-rollback"  data-pane="rollback">⏪ Rollback</button>
+      </div>
+
+      <!-- ── Termination Pane ── -->
+      <div class="recovery-pane active" id="pane-terminate">
+        <div class="form-row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
+          <select id="term-pid-select" style="flex:1;min-width:120px" title="Pick a deadlocked process to terminate"></select>
+          <button id="btn-term-one" class="btn-danger btn-sm">Kill Selected</button>
+          <button id="btn-term-all" class="btn-danger btn-sm">Kill All Deadlocked</button>
+        </div>
+        <div class="form-row" style="flex-wrap:wrap;gap:8px">
+          <select id="term-policy-select" style="flex:1;min-width:140px" title="Policy for sequential termination">
+            <option value="lowest-priority">Lowest Priority First</option>
+            <option value="fewest-held">Fewest Resources Held</option>
+            <option value="most-held">Most Resources Held</option>
+          </select>
+          <button id="btn-term-policy" class="btn-warning btn-sm">Kill by Policy</button>
+        </div>
+      </div>
+
+      <!-- ── Preemption Pane ── -->
+      <div class="recovery-pane" id="pane-preempt">
+        <div id="preempt-warn" class="warn-msg" style="display:none"></div>
+        <div class="form-grid">
+          <label>Victim process</label>
+          <div class="form-row">
+            <select id="preempt-victim" style="flex:1"><option value="">— victim —</option></select>
+            <button id="btn-suggest-victim" class="btn-outline btn-sm" title="Suggest victim (fewest preemptions)">💡 Suggest</button>
+          </div>
+          <label>Resource</label>
+          <select id="preempt-rid"><option value="">— resource —</option></select>
+          <label>Instances</label>
+          <input id="preempt-count" type="number" min="1" step="1" value="1" style="width:60px" />
+          <label>Recipient process</label>
+          <select id="preempt-recipient"><option value="">— recipient —</option></select>
+        </div>
+        <button id="btn-preempt" class="btn-warning btn-sm" style="margin-top:8px">⬇ Preempt</button>
+      </div>
+
+      <!-- ── Rollback Pane ── -->
+      <div class="recovery-pane" id="pane-rollback">
+        <div id="rollback-none" class="empty-hint" style="display:none">No checkpoints saved yet. Use "Save checkpoint" below or run detection on a safe state to auto-save one.</div>
+        <div class="form-grid">
+          <label>Checkpoint</label>
+          <select id="rollback-ckpt-select" disabled><option value="">No checkpoints</option></select>
+          <label>Process (for single rollback)</label>
+          <select id="rollback-pid-select" disabled><option value="">— process —</option></select>
+        </div>
+        <div class="form-row" style="margin-top:8px;gap:8px;flex-wrap:wrap">
+          <button id="btn-rollback-system"  class="btn-warning btn-sm" disabled>⏪ Roll Back Whole System</button>
+          <button id="btn-rollback-process" class="btn-warning btn-sm" disabled>⏪ Roll Back One Process</button>
+        </div>
+        <!-- Manual checkpoint save -->
+        <div class="form-row" style="margin-top:12px;gap:8px;border-top:1px solid var(--border);padding-top:10px">
+          <input id="input-ckpt-label" type="text" placeholder="Checkpoint label (optional)" style="flex:1" />
+          <button id="btn-save-ckpt" class="btn-outline btn-sm">💾 Save Checkpoint</button>
+        </div>
+      </div>
+    </div><!-- /recovery-panel -->
+
+    <!-- ══ Before/After Comparison Panel ══ -->
+    <div id="compare-panel" class="panel-section" style="display:none">
+      <h3>📊 Before / After Recovery</h3>
+      <div id="compare-panel-wrap"></div>
+    </div>
+
+    <!-- ══ Recovery History ══ -->
+    <div class="panel-section">
+      <h3>📋 Recovery History</h3>
+      <ul id="recovery-history-list" class="recovery-history-list">
+        <li class="empty-hint">No recovery actions yet.</li>
+      </ul>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+         PHASE 7: SAVE / LOAD / EXPORT / IMPORT
+    ══════════════════════════════════════════════════ -->
+    <div class="panel-section">
+      <h3>💾 Save / Load Scenarios</h3>
+      <div class="form-row" style="margin-bottom:8px">
+        <input id="input-scenario-name" type="text" placeholder="Scenario name" style="flex:1" />
+        <button id="btn-save-scenario" class="btn-primary btn-sm">Save</button>
+      </div>
+      <ul id="scenario-list" class="scenario-list">
+        <li class="empty-hint">No saved scenarios.</li>
+      </ul>
+      <div class="form-row" style="margin-top:10px;gap:8px;border-top:1px solid var(--border);padding-top:10px">
+        <button id="btn-export" class="btn-outline btn-sm">⬆ Export JSON</button>
+        <label class="btn-outline btn-sm" style="cursor:pointer" title="Import a JSON state file">
+          ⬇ Import JSON
+          <input id="input-import" type="file" accept=".json" style="display:none" />
+        </label>
+      </div>
+    </div>
+
+  </div><!-- /right-panel -->
+</div><!-- /app-body -->
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
