@@ -143,6 +143,7 @@ function makeCompareTable(title, processes, resources, beforeMatrix, afterMatrix
  * @param {string} summaryText
  * @param {object} [beforeDetect]   — detection result for before state
  * @param {object} [afterDetect]    — detection result for after state
+ * @param {string[]} [details]      — bullet-point details from the recovery function
  * @returns {{ beforeCy, afterCy }}  — Cytoscape instances for later cleanup
  */
 function renderBeforeAfter(
@@ -153,7 +154,8 @@ function renderBeforeAfter(
   afterAvail,
   summaryText,
   beforeDetect,
-  afterDetect
+  afterDetect,
+  details
 ) {
   container.innerHTML = "";
 
@@ -162,6 +164,18 @@ function renderBeforeAfter(
   summaryEl.className = "compare-summary";
   summaryEl.textContent = summaryText;
   container.appendChild(summaryEl);
+
+  // ── Details bullets ────────────────────────────────────────────────────
+  if (details && details.length > 0) {
+    const detailsEl = document.createElement("ul");
+    detailsEl.className = "compare-details";
+    for (const line of details) {
+      const li = document.createElement("li");
+      li.textContent = line;
+      detailsEl.appendChild(li);
+    }
+    container.appendChild(detailsEl);
+  }
 
   // ── Verdict line ───────────────────────────────────────────────────────
   if (afterDetect) {

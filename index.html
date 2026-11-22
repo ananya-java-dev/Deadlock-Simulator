@@ -125,17 +125,17 @@
       <div class="recovery-pane" id="pane-preempt">
         <div id="preempt-warn" class="warn-msg" style="display:none"></div>
         <div class="form-grid">
+          <label>Resource</label>
+          <select id="preempt-rid"><option value="">— select resource first —</option></select>
           <label>Victim process</label>
           <div class="form-row">
-            <select id="preempt-victim" style="flex:1"><option value="">— victim —</option></select>
-            <button id="btn-suggest-victim" class="btn-outline btn-sm" title="Suggest victim (fewest preemptions)">💡 Suggest</button>
+            <select id="preempt-victim" style="flex:1"><option value="">— select victim —</option></select>
+            <button id="btn-suggest-victim" class="btn-outline btn-sm" title="Suggest victim (fewest preemptions, then lowest priority, then most of resource)">💡 Suggest</button>
           </div>
-          <label>Resource</label>
-          <select id="preempt-rid"><option value="">— resource —</option></select>
           <label>Instances</label>
           <input id="preempt-count" type="number" min="1" step="1" value="1" style="width:60px" />
           <label>Recipient process</label>
-          <select id="preempt-recipient"><option value="">— recipient —</option></select>
+          <select id="preempt-recipient"><option value="">— select recipient —</option></select>
         </div>
         <button id="btn-preempt" class="btn-warning btn-sm" style="margin-top:8px">⬇ Preempt</button>
       </div>
@@ -148,6 +148,11 @@
           <select id="rollback-ckpt-select" disabled><option value="">No checkpoints</option></select>
           <label>Process (for single rollback)</label>
           <select id="rollback-pid-select" disabled><option value="">— process —</option></select>
+          <label>Mode</label>
+          <select id="rollback-mode-select">
+            <option value="checkpoint">Roll back to checkpoint (alloc = min, request = checkpoint)</option>
+            <option value="restart">Restart process (release everything, request = checkpoint)</option>
+          </select>
         </div>
         <div class="form-row" style="margin-top:8px;gap:8px;flex-wrap:wrap">
           <button id="btn-rollback-system"  class="btn-warning btn-sm" disabled>⏪ Roll Back Whole System</button>

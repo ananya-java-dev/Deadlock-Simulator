@@ -74,12 +74,25 @@ let _checkpointIdCounter = 0;
 const _checkpoints = [];
 
 /**
- * Saves a checkpoint. Returns the checkpoint object.
+ * Saves a checkpoint. Skips if the snapshot is identical to the most recent one.
  * @param {object} snapshot — from Model.cloneState()
  * @param {string} label
- * @returns {object} checkpoint
+ * @returns {object} checkpoint — the new one, or the existing one if skipped
  */
 function saveCheckpoint(snapshot, label) {
+  // De-duplicate: skip if identical to the most recent checkpoint
+  if (_checkpoints.length > 0) {
+    const last = _checkpoints[_checkpoints.length - 1];
+    // Compare processes, allocation and request (ignore internal _label/_savedAt keys)
+    const strip = (s) => JSON.stringify({
+      processes: s.processes,
+      resources: s.resources,
+      allocation: s.allocation,
+      request: s.request,
+    });
+    if (strip(last.snapshot) === strip(snapshot)) return last;
+  }
+
   const checkpoint = {
     id: ++_checkpointIdCounter,
     label: label || `Checkpoint ${_checkpointIdCounter}`,

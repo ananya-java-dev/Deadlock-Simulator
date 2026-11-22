@@ -1,4 +1,4 @@
-﻿/**
+/**
  * main.js — Wires ALL modules together: model, detector, graph, ui,
  *           recovery, history, storage and compare.
  * This is the only file that imports from all other modules.
@@ -75,21 +75,62 @@ const PRESETS = [
     label: "6 — Deadlock with Safe Checkpoint for Rollback",
     state: {
       processes: ["P1","P2"],
-      resources: [{ id:"R1",total:2 },{ id:"R2",total:2 }],
-      // Current state: each holds 1 of each, wants 1 more of the other
+      resources: [{ id:"R1",total:1 },{ id:"R2",total:1 }],
+      // Classic deadlock: P1 holds R1 wants R2; P2 holds R2 wants R1
       allocation: { P1:{R1:1,R2:0}, P2:{R1:0,R2:1} },
       request:    { P1:{R1:0,R2:1}, P2:{R1:1,R2:0} },
       processMeta:{ P1:{priority:1,preemptCount:0}, P2:{priority:1,preemptCount:0} },
     },
-    // This preset includes a built-in checkpoint (loaded by main.js after loading state)
+    // Built-in checkpoint: both idle (safe state)
     checkpoint: {
       label: "Safe state (before deadlock)",
       snapshot: {
         processes: ["P1","P2"],
-        resources: [{ id:"R1",total:2 },{ id:"R2",total:2 }],
+        resources: [{ id:"R1",total:1 },{ id:"R2",total:1 }],
         allocation: { P1:{R1:0,R2:0}, P2:{R1:0,R2:0} },
         request:    { P1:{R1:0,R2:0}, P2:{R1:0,R2:0} },
         processMeta:{ P1:{priority:1,preemptCount:0}, P2:{priority:1,preemptCount:0} },
+      },
+    },
+  },
+  {
+    label: "7 — Your Test: 5 Procs, 3 Resources (Safe→Deadlock by P2 request)",
+    state: {
+      // DEADLOCK STATE: P2 request[R2] = 1 causes deadlock (P1,P2,P3,P4 blocked)
+      // Available = [0,0,0]. Only P0 finishes trivially. Others are stuck.
+      processes: ["P0","P1","P2","P3","P4"],
+      resources: [{ id:"R0",total:7 },{ id:"R1",total:2 },{ id:"R2",total:6 }],
+      allocation: {
+        P0:{R0:0,R1:1,R2:0}, P1:{R0:2,R1:0,R2:0},
+        P2:{R0:3,R1:0,R2:3}, P3:{R0:2,R1:1,R2:1}, P4:{R0:0,R1:0,R2:2},
+      },
+      request: {
+        P0:{R0:0,R1:0,R2:0}, P1:{R0:2,R1:0,R2:2},
+        P2:{R0:0,R1:0,R2:1}, P3:{R0:1,R1:0,R2:0}, P4:{R0:0,R1:0,R2:2},
+      },
+      processMeta: {
+        P0:{priority:1,preemptCount:0}, P1:{priority:2,preemptCount:0},
+        P2:{priority:1,preemptCount:0}, P3:{priority:3,preemptCount:0}, P4:{priority:2,preemptCount:0},
+      },
+    },
+    // Safe checkpoint: same allocation, but P2 request[R2] = 0
+    checkpoint: {
+      label: "Safe state (P2 request R2=0)",
+      snapshot: {
+        processes: ["P0","P1","P2","P3","P4"],
+        resources: [{ id:"R0",total:7 },{ id:"R1",total:2 },{ id:"R2",total:6 }],
+        allocation: {
+          P0:{R0:0,R1:1,R2:0}, P1:{R0:2,R1:0,R2:0},
+          P2:{R0:3,R1:0,R2:3}, P3:{R0:2,R1:1,R2:1}, P4:{R0:0,R1:0,R2:2},
+        },
+        request: {
+          P0:{R0:0,R1:0,R2:0}, P1:{R0:2,R1:0,R2:2},
+          P2:{R0:0,R1:0,R2:0}, P3:{R0:1,R1:0,R2:0}, P4:{R0:0,R1:0,R2:2},
+        },
+        processMeta: {
+          P0:{priority:1,preemptCount:0}, P1:{priority:2,preemptCount:0},
+          P2:{priority:1,preemptCount:0}, P3:{priority:3,preemptCount:0}, P4:{priority:2,preemptCount:0},
+        },
       },
     },
   },
@@ -160,6 +201,7 @@ const preemptWarn        = $("preempt-warn");
 // Rollback controls
 const rollbackCkptSelect = $("rollback-ckpt-select");
 const rollbackPidSelect  = $("rollback-pid-select");
+const rollbackModeSelect = $("rollback-mode-select");
 const btnRollbackSystem  = $("btn-rollback-system");
 const btnRollbackProcess = $("btn-rollback-process");
 const rollbackNone       = $("rollback-none");
@@ -385,11 +427,14 @@ function runDetection() {
   renderVerdict(verdictBanner, result);
   setRecoveryEnabled(result.isDeadlock);
 
-  // Auto-checkpoint when safe
+  // Auto-checkpoint when safe; history.js skips duplicates
   if (!result.isDeadlock) {
+    const prevCount = getCheckpoints().length;
     const ck = saveCheckpoint(Model.cloneState(), "Auto (safe state)");
     updateCheckpointUI();
-    toast(`Safe state auto-saved as checkpoint "${ck.label}".`, "info");
+    if (getCheckpoints().length > prevCount) {
+      toast(`Safe state auto-saved as checkpoint "${ck.label}".`, "info");
+    }
   }
 
   return result;
@@ -475,23 +520,7 @@ function populateRecoveryControls(deadlockedPids) {
     termPidSelect.appendChild(opt);
   }
 
-  // Preemption: all processes as victim candidates
-  preemptVictim.innerHTML = `<option value="">— select victim —</option>`;
-  preemptRecipient.innerHTML = `<option value="">— select recipient —</option>`;
-  for (const pid of state.processes) {
-    const meta = Model.getProcessMeta(pid);
-    const opt1 = document.createElement("option");
-    opt1.value = pid;
-    opt1.textContent = `${pid} (preempted ${meta.preemptCount}×)`;
-    preemptVictim.appendChild(opt1);
-
-    const opt2 = document.createElement("option");
-    opt2.value = pid;
-    opt2.textContent = pid;
-    preemptRecipient.appendChild(opt2);
-  }
-
-  // Preemption: resource list
+  // Preemption: resource list first (drives victim/recipient)
   preemptRid.innerHTML = `<option value="">— select resource —</option>`;
   for (const { id: rid } of state.resources) {
     const opt = document.createElement("option");
@@ -500,14 +529,26 @@ function populateRecoveryControls(deadlockedPids) {
     preemptRid.appendChild(opt);
   }
 
+  // Victim/recipient start empty; they populate when resource is chosen
+  preemptVictim.innerHTML = `<option value="">— select victim —</option>`;
+  preemptRecipient.innerHTML = `<option value="">— select recipient —</option>`;
+  preemptCount2.value = "1";
+  preemptCount2.max = "";
+
   // Rollback: process list
-  rollbackPidSelect.innerHTML = `<option value="">— select process —</option>`;
+  rollbackPidSelect.innerHTML = "";
+  const rlbPlaceholder = document.createElement("option");
+  rlbPlaceholder.value = "";
+  rlbPlaceholder.textContent = "— select process —";
+  rlbPlaceholder.selected = true;
+  rollbackPidSelect.appendChild(rlbPlaceholder);
   for (const pid of state.processes) {
     const opt = document.createElement("option");
     opt.value = pid;
     opt.textContent = pid;
     rollbackPidSelect.appendChild(opt);
   }
+  rollbackPidSelect.disabled = false;
 
   updatePreemptWarning();
   updateCheckpointUI();
@@ -515,6 +556,93 @@ function populateRecoveryControls(deadlockedPids) {
 
 // Update preemption starvation warning when victim changes
 preemptVictim.addEventListener("change", updatePreemptWarning);
+
+/**
+ * When a resource is chosen in the preemption pane, filter victim/recipient lists
+ * and update the max instances input.
+ */
+preemptRid.addEventListener("change", () => {
+  const rid = preemptRid.value;
+  const state = Model.getState();
+  const currentVictim    = preemptVictim.value;
+  const currentRecipient = preemptRecipient.value;
+
+  // Victim = processes holding >= 1 of this resource
+  preemptVictim.innerHTML = `<option value="">— select victim —</option>`;
+  if (rid) {
+    for (const pid of state.processes) {
+      if ((state.allocation[pid]?.[rid] ?? 0) >= 1) {
+        const meta = Model.getProcessMeta(pid);
+        const opt = document.createElement("option");
+        opt.value = pid;
+        opt.textContent = `${pid} (holds ${state.allocation[pid][rid]}, preempted ${meta.preemptCount}×)`;
+        if (pid === currentVictim) opt.selected = true;
+        preemptVictim.appendChild(opt);
+      }
+    }
+  }
+
+  // Recipient = processes with outstanding request > 0 for this resource
+  preemptRecipient.innerHTML = `<option value="">— select recipient —</option>`;
+  if (rid) {
+    for (const pid of state.processes) {
+      if ((state.request[pid]?.[rid] ?? 0) > 0) {
+        const opt = document.createElement("option");
+        opt.value = pid;
+        opt.textContent = `${pid} (needs ${state.request[pid][rid]})`;
+        if (pid === currentRecipient) opt.selected = true;
+        preemptRecipient.appendChild(opt);
+      }
+    }
+  }
+
+  // Cross-exclude: chosen victim hidden from recipient and vice versa
+  updatePreemptCrossExclusion();
+  updatePreemptMaxInstances();
+  updatePreemptWarning();
+});
+
+preemptVictim.addEventListener("change", () => {
+  updatePreemptCrossExclusion();
+  updatePreemptMaxInstances();
+  updatePreemptWarning();
+});
+
+preemptRecipient.addEventListener("change", () => {
+  updatePreemptCrossExclusion();
+  updatePreemptMaxInstances();
+});
+
+/** Hides the selected victim from recipient list and vice versa. */
+function updatePreemptCrossExclusion() {
+  const victim    = preemptVictim.value;
+  const recipient = preemptRecipient.value;
+  for (const opt of preemptVictim.options) {
+    opt.hidden = (opt.value !== "" && opt.value === recipient);
+  }
+  for (const opt of preemptRecipient.options) {
+    opt.hidden = (opt.value !== "" && opt.value === victim);
+  }
+}
+
+/** Sets max on the instances input = min(victim holds, recipient requests). */
+function updatePreemptMaxInstances() {
+  const rid       = preemptRid.value;
+  const victim    = preemptVictim.value;
+  const recipient = preemptRecipient.value;
+  if (!rid || !victim || !recipient) {
+    preemptCount2.max = "";
+    return;
+  }
+  const state   = Model.getState();
+  const holds   = state.allocation[victim]?.[rid] ?? 0;
+  const needs   = state.request[recipient]?.[rid] ?? 0;
+  const maxVal  = Math.min(holds, needs);
+  preemptCount2.max = maxVal > 0 ? String(maxVal) : "0";
+  if (parseInt(preemptCount2.value, 10) > maxVal) {
+    preemptCount2.value = String(maxVal > 0 ? maxVal : 1);
+  }
+}
 
 function updatePreemptWarning() {
   const pid = preemptVictim.value;
@@ -582,7 +710,8 @@ function applyRecovery(beforeState, recoveryResult, technique) {
   _compareCy = renderBeforeAfter(
     comparePanelWrap,
     beforeState, state, beforeAvail, available,
-    summary, beforeDetect, afterResult
+    summary, beforeDetect, afterResult,
+    details || []
   );
   comparePanel.style.display = "block";
 
@@ -677,9 +806,14 @@ btnTermPolicy.addEventListener("click", () => {
     (s, a) => detectDeadlock(s, a)
   );
   // Flatten into a single applyRecovery call with finalState
-  applyRecovery(before, { newState: result.finalState, summary: result.summary, details: result.rounds.map((r) => r.reason) }, `Terminate by Policy (${policy})`);
-  // Also show rounds in toast
-  result.rounds.forEach((r) => toast(`Terminated ${r.pid}: ${r.reason}`, "info"));
+  // details includes one line per round; rounds also shown as individual toasts
+  applyRecovery(before, {
+    newState: result.finalState,
+    summary: result.summary,
+    details: result.details,
+  }, `Terminate by Policy (${policy})`);
+  // Also show each round as a toast for visibility
+  result.rounds.forEach((r) => toast(`Round: ${r.pid} terminated — ${r.reason}`, "info"));
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -687,12 +821,26 @@ btnTermPolicy.addEventListener("click", () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 btnSuggestVictim.addEventListener("click", () => {
+  const rid       = preemptRid.value;
+  const recipient = preemptRecipient.value;
+  if (!rid) {
+    toast("Select a resource first before suggesting a victim.", "warn");
+    return;
+  }
+  if (!recipient) {
+    toast("Select a recipient first before suggesting a victim.", "warn");
+    return;
+  }
   const state = Model.getState();
-  const suggested = suggestPreemptVictim(state);
+  const suggested = suggestPreemptVictim(state, rid, recipient);
   if (suggested) {
     preemptVictim.value = suggested;
+    updatePreemptCrossExclusion();
+    updatePreemptMaxInstances();
     updatePreemptWarning();
-    toast(`Suggested victim: ${suggested} (lowest preempt count).`, "info");
+    toast(`Suggested victim: ${suggested} (lowest preempt count, then lowest priority, then most ${rid}).`, "info");
+  } else {
+    toast(`No valid victim found for resource ${rid} (excluding ${recipient}).`, "warn");
   }
 });
 
@@ -703,7 +851,9 @@ btnPreempt.addEventListener("click", () => {
   const recipient = preemptRecipient.value;
 
   if (!victim || !rid || !recipient) {
-    showError(errorGeneral, "Select victim, resource and recipient for preemption.");
+    const msg = "Select resource, victim and recipient for preemption.";
+    showError(errorGeneral, msg);
+    toast(msg, "warn");
     return;
   }
 
@@ -712,6 +862,7 @@ btnPreempt.addEventListener("click", () => {
 
   if (!result.ok) {
     showError(errorGeneral, result.error);
+    toast(result.error, "error");
     return;
   }
 
@@ -755,8 +906,13 @@ btnRollbackSystem.addEventListener("click", () => {
   const ck = getCheckpoints().find((c) => c.id === ckId);
   if (!ck) { toast("Select a valid checkpoint.", "warn"); return; }
   const before = Model.cloneState();
-  const result = rollbackSystem(ck.snapshot);
-  if (result.warnings.length) result.warnings.forEach((w) => toast(w, "warn"));
+  const result = rollbackSystem(before, ck.snapshot);
+  if (!result.ok) {
+    showError(errorGeneral, result.error);
+    toast(result.error, "warn");
+    return;
+  }
+  if (result.warnings?.length) result.warnings.forEach((w) => toast(w, "warn"));
   applyRecovery(before, result, "Rollback System");
 });
 
@@ -766,10 +922,16 @@ btnRollbackProcess.addEventListener("click", () => {
   if (!ck) { toast("Select a valid checkpoint.", "warn"); return; }
   const pid = rollbackPidSelect.value;
   if (!pid) { toast("Select a process to roll back.", "warn"); return; }
+  const mode   = rollbackModeSelect ? rollbackModeSelect.value : "checkpoint";
   const before = Model.cloneState();
-  const result = rollbackProcess(before, pid, ck.snapshot);
-  if (result.warnings.length) result.warnings.forEach((w) => toast(w, "warn"));
-  applyRecovery(before, result, `Rollback Process ${pid}`);
+  const result = rollbackProcess(before, pid, ck.snapshot, mode);
+  if (!result.ok) {
+    showError(errorGeneral, result.error);
+    toast(result.error, "warn");
+    return;
+  }
+  if (result.warnings?.length) result.warnings.forEach((w) => toast(w, "warn"));
+  applyRecovery(before, result, `Rollback Process ${pid} (${mode})`);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

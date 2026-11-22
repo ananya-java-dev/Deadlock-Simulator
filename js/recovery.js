@@ -29,6 +29,21 @@ function fmtVec(obj, rids) {
   return "[" + rids.map((r) => obj?.[r] ?? 0).join(", ") + "]";
 }
 
+/**
+ * Returns true if two state snapshots are functionally identical
+ * (same processes, same allocation values, same request values).
+ */
+function statesEqual(a, b) {
+  if (JSON.stringify(a.processes.slice().sort()) !== JSON.stringify(b.processes.slice().sort())) return false;
+  for (const pid of a.processes) {
+    for (const { id: rid } of a.resources) {
+      if ((a.allocation[pid]?.[rid] ?? 0) !== (b.allocation[pid]?.[rid] ?? 0)) return false;
+      if ((a.request[pid]?.[rid] ?? 0) !== (b.request[pid]?.[rid] ?? 0)) return false;
+    }
+  }
+  return true;
+}
+
 // ─── Process Termination ───────────────────────────────────────────────────
 
 /**
@@ -118,7 +133,7 @@ function terminateAll(state, pids) {
  * @param {string[]} deadlockedPids
  * @param {string} policy
  * @param {Function} detectFn  — (state, avail) => { isDeadlock, deadlockedProcesses }
- * @returns {{ rounds, finalState, summary }}
+ * @returns {{ rounds, finalState, summary, details }}
  */
 function terminateByPolicy(state, deadlockedPids, policy, detectFn) {
   let s = clone(state);
@@ -136,10 +151,9 @@ function terminateByPolicy(state, deadlockedPids, policy, detectFn) {
     const reason = policyReason(s, victim, policy, rids);
     const result = terminateProcess(s, victim);
     s = result.newState;
-    remaining = remaining.filter((p) => p !== victim && s.processes.includes(p));
+
     // Update remaining to only include processes still in state that are deadlocked
-    const newAvail2 = computeAvailable(s);
-    const newDetect = detectFn(s, newAvail2);
+    const newDetect = detectFn(s, computeAvailable(s));
     remaining = newDetect.isDeadlock ? newDetect.deadlockedProcesses : [];
 
     rounds.push({ pid: victim, reason, summary: result.summary, newState: clone(s) });
@@ -147,11 +161,19 @@ function terminateByPolicy(state, deadlockedPids, policy, detectFn) {
 
   const finalAvail = computeAvailable(s);
   const finalDetect = detectFn(s, finalAvail);
-  const summary = finalDetect.isDeadlock
-    ? `Policy "${policy}": terminated ${rounds.map((r) => r.pid).join(", ")} but deadlock persists.`
-    : `Policy "${policy}": terminated ${rounds.map((r) => r.pid).join(", ")}. Deadlock resolved.`;
+  const resolved = !finalDetect.isDeadlock;
+  const summary = resolved
+    ? `Policy "${policy}": terminated ${rounds.map((r) => r.pid).join(", ")}. Deadlock resolved.`
+    : `Policy "${policy}": terminated ${rounds.map((r) => r.pid).join(", ")} but deadlock persists.`;
 
-  return { rounds, finalState: s, summary };
+  // Build per-round details for display
+  const details = rounds.map(
+    (r, i) => `Round ${i + 1}: ${r.pid} terminated — ${r.reason}`
+  );
+  if (resolved) details.push(`Deadlock resolved.`);
+  else details.push(`Deadlock persists after all rounds.`);
+
+  return { rounds, finalState: s, summary, details };
 }
 
 /** Picks a victim process from remaining according to policy. */
@@ -204,6 +226,7 @@ function policyReason(state, pid, policy, rids) {
  *  - Victim's allocation[rid] decreases by count
  *  - Recipient's allocation[rid] increases by count, request[rid] decreases by count
  *  - Victim's request[rid] increases by count (it must re-acquire)
+ *  - Victim's new total request[rid] must not exceed resource total
  *
  * @returns {{ ok, error?, newState, summary, details }}
  */
@@ -217,7 +240,8 @@ function preemptResource(state, victimPid, rid, count, recipientPid) {
     return { ok: false, error: `Victim process "${victimPid}" not found.` };
   if (!state.processes.includes(recipientPid))
     return { ok: false, error: `Recipient process "${recipientPid}" not found.` };
-  if (!state.resources.some((r) => r.id === rid))
+  const resource = state.resources.find((r) => r.id === rid);
+  if (!resource)
     return { ok: false, error: `Resource "${rid}" not found.` };
   if (!Number.isInteger(count) || count < 1)
     return { ok: false, error: "Preempt count must be a positive integer." };
@@ -241,6 +265,15 @@ function preemptResource(state, victimPid, rid, count, recipientPid) {
       error: `Cannot give ${count} of "${rid}" to ${recipientPid}: it only requests ${recipientRequest}.`,
     };
 
+  // Check victim's new request won't exceed total
+  const victimCurrentReq = state.request[victimPid]?.[rid] ?? 0;
+  const victimNewReq = victimCurrentReq + count;
+  if (victimNewReq > resource.total)
+    return {
+      ok: false,
+      error: `Preemption would give ${victimPid} a request of ${victimNewReq} for "${rid}", which exceeds the total (${resource.total}).`,
+    };
+
   // ── Apply ────────────────────────────────────────────────────────────────
   const s = clone(state);
   const rids = s.resources.map((r) => r.id);
@@ -249,7 +282,7 @@ function preemptResource(state, victimPid, rid, count, recipientPid) {
   s.allocation[recipientPid][rid] += count;
   s.request[recipientPid][rid] -= count;
   // Victim must re-acquire what was taken
-  s.request[victimPid][rid] = (s.request[victimPid]?.[rid] ?? 0) + count;
+  s.request[victimPid][rid] = victimCurrentReq + count;
   // Increment preemptCount in meta
   if (s.processMeta?.[victimPid]) {
     s.processMeta[victimPid].preemptCount = (s.processMeta[victimPid].preemptCount ?? 0) + 1;
@@ -261,27 +294,32 @@ function preemptResource(state, victimPid, rid, count, recipientPid) {
   return {
     ok: true,
     newState: s,
-    summary: `Preempted ${count}x "${rid}" from ${victimPid} → ${recipientPid}. Available: ${availStr}.`,
+    summary: `Preempted ${count}× "${rid}" from ${victimPid} → ${recipientPid}. Available: ${availStr}.`,
     details: [
       `${victimPid} allocation[${rid}]: ${victimHolds} → ${s.allocation[victimPid][rid]}.`,
-      `${victimPid} request[${rid}] increased by ${count} (must re-acquire).`,
-      `${recipientPid} allocation[${rid}] += ${count}.`,
-      `${recipientPid} request[${rid}] -= ${count}.`,
+      `${victimPid} request[${rid}]: ${victimCurrentReq} → ${s.request[victimPid][rid]} (must re-acquire).`,
+      `${recipientPid} allocation[${rid}]: +${count} (now ${s.allocation[recipientPid][rid]}).`,
+      `${recipientPid} request[${rid}]: −${count} (now ${s.request[recipientPid][rid]}).`,
       `New available: ${availStr}.`,
     ],
   };
 }
 
 /**
- * Suggests the best preemption victim: process with the lowest preemptCount,
- * breaking ties by most resources held.
+ * Suggests the best preemption victim for the given resource and recipient.
+ * Considers only processes holding >= 1 of rid, excluding recipient.
+ * Preference: lowest preemptCount → lowest priority → most instances of rid.
+ *
  * @param {object} state
- * @param {string[]} candidates — usually deadlocked processes
+ * @param {string} rid          — resource being preempted (required)
+ * @param {string} [excludePid] — recipient pid to exclude
  * @returns {string | null}
  */
-function suggestPreemptVictim(state) {
-  const rids = state.resources.map((r) => r.id);
-  const candidates = state.processes;
+function suggestPreemptVictim(state, rid, excludePid) {
+  if (!rid) return null;
+  const candidates = state.processes.filter(
+    (pid) => pid !== excludePid && (state.allocation[pid]?.[rid] ?? 0) >= 1
+  );
   if (candidates.length === 0) return null;
 
   return candidates.reduce((best, pid) => {
@@ -289,9 +327,15 @@ function suggestPreemptVictim(state) {
     const pc = state.processMeta?.[pid]?.preemptCount ?? 0;
     if (pc < bc) return pid;
     if (pc === bc) {
-      const bh = rids.reduce((s, r) => s + (state.allocation[best]?.[r] ?? 0), 0);
-      const ph = rids.reduce((s, r) => s + (state.allocation[pid]?.[r] ?? 0), 0);
-      return ph > bh ? pid : best;
+      const bp = state.processMeta?.[best]?.priority ?? 1;
+      const pp = state.processMeta?.[pid]?.priority ?? 1;
+      if (pp < bp) return pid;        // lower priority = better victim
+      if (pp === bp) {
+        // Most instances of this resource
+        const bh = state.allocation[best]?.[rid] ?? 0;
+        const ph = state.allocation[pid]?.[rid] ?? 0;
+        return ph > bh ? pid : best;
+      }
     }
     return best;
   });
@@ -302,20 +346,30 @@ function suggestPreemptVictim(state) {
 /**
  * Rolls back the WHOLE system to a checkpoint.
  * Handles missing processes/resources in the checkpoint gracefully.
+ * Returns { ok:false, error } if the result is identical to current state.
  *
- * @param {object} checkpoint  — saved state snapshot
- * @returns {{ newState, summary, details, warnings }}
+ * @param {object} currentState  — current live state (for no-op check)
+ * @param {object} checkpoint    — saved state snapshot
+ * @returns {{ ok, error?, newState, summary, details, warnings }}
  */
-function rollbackSystem(checkpoint) {
-  const s = clone(checkpoint);
+function rollbackSystem(currentState, checkpoint) {
+  const s = JSON.parse(JSON.stringify(checkpoint));
   const warnings = [];
 
-  // Warn about potentially stale data
   if (!s.processes || !s.resources) {
     warnings.push("Checkpoint is missing process or resource data.");
   }
 
+  // No-op check
+  if (statesEqual(currentState, s)) {
+    return {
+      ok: false,
+      error: `Rolling back to this checkpoint changes nothing: the system already matches it. Pick a different checkpoint.`,
+    };
+  }
+
   return {
+    ok: true,
     newState: s,
     summary: `System rolled back to checkpoint "${checkpoint._label ?? "saved state"}" (${checkpoint._savedAt ?? "unknown time"}).`,
     details: [`All processes and resources restored to checkpoint state.`],
@@ -325,58 +379,101 @@ function rollbackSystem(checkpoint) {
 
 /**
  * Rolls back ONE process to a checkpoint state.
- * Sets its allocation to min(current, checkpoint) per resource.
- * Keeps its current request unchanged.
- * Releases the difference back to other processes (increases available).
+ *
+ * Mode "checkpoint" (default):
+ *   allocation = min(current, checkpoint) per resource
+ *   request    = checkpoint's request for that process (0 if absent)
+ *
+ * Mode "restart":
+ *   allocation = all zeros (releases everything)
+ *   request    = checkpoint's request for that process (0 if absent)
+ *
+ * Returns { ok:false, error } if the result would be identical to current state.
  *
  * @param {object} state      — current live state
  * @param {string} pid        — process to roll back
  * @param {object} checkpoint — saved state snapshot
- * @returns {{ newState, summary, details, warnings }}
+ * @param {string} [mode]     — "checkpoint" | "restart"
+ * @returns {{ ok, error?, newState, summary, details, warnings }}
  */
-function rollbackProcess(state, pid, checkpoint) {
-  const s = clone(state);
+function rollbackProcess(state, pid, checkpoint, mode = "checkpoint") {
+  const s = JSON.parse(JSON.stringify(state));
   const rids = s.resources.map((r) => r.id);
   const details = [];
   const warnings = [];
 
   if (!s.processes.includes(pid)) {
     return {
-      newState: s,
-      summary: `Cannot rollback: process "${pid}" not found in current state.`,
-      details: [],
-      warnings: [`Process "${pid}" not found.`],
+      ok: false,
+      error: `Cannot rollback: process "${pid}" not found in current state.`,
     };
   }
 
-  if (!checkpoint.processes?.includes(pid)) {
-    warnings.push(`Process "${pid}" did not exist in checkpoint; allocation reset to 0.`);
-    // Reset allocation to 0 — safest fallback
-    for (const rid of rids) {
-      const prev = s.allocation[pid]?.[rid] ?? 0;
-      if (prev > 0) details.push(`${pid} alloc[${rid}]: ${prev} → 0`);
-      if (s.allocation[pid]) s.allocation[pid][rid] = 0;
-    }
-  } else {
-    for (const rid of rids) {
-      const curr = s.allocation[pid]?.[rid] ?? 0;
-      const ckpt = checkpoint.allocation?.[pid]?.[rid] ?? 0;
-      const newAlloc = Math.min(curr, ckpt);
-      if (curr !== newAlloc) {
-        details.push(`${pid} alloc[${rid}]: ${curr} → ${newAlloc} (released ${curr - newAlloc}).`);
-      }
-      if (s.allocation[pid]) s.allocation[pid][rid] = newAlloc;
-    }
+  const pidInCkpt = checkpoint.processes?.includes(pid);
+  if (!pidInCkpt) {
+    warnings.push(`Process "${pid}" did not exist in checkpoint; checkpoint allocation/request treated as 0.`);
   }
 
-  const newAvail = computeAvailable(s);
-  const availStr = fmtVec(newAvail, rids);
-  details.push(`New available: ${availStr}.`);
-  details.push(`${pid} request unchanged; it must re-acquire released resources.`);
+  const prevAllocVec = rids.map((r) => s.allocation[pid]?.[r] ?? 0);
+  const prevReqVec   = rids.map((r) => s.request[pid]?.[r] ?? 0);
+
+  // Target allocation per mode
+  for (const rid of rids) {
+    const curr      = s.allocation[pid]?.[rid] ?? 0;
+    const ckptAlloc = pidInCkpt ? (checkpoint.allocation?.[pid]?.[rid] ?? 0) : 0;
+    const ckptReq   = pidInCkpt ? (checkpoint.request?.[pid]?.[rid] ?? 0) : 0;
+
+    let newAlloc;
+    if (mode === "restart") {
+      newAlloc = 0;
+    } else {
+      newAlloc = Math.min(curr, ckptAlloc);
+    }
+
+    if (s.allocation[pid]) s.allocation[pid][rid] = newAlloc;
+    if (s.request[pid])    s.request[pid][rid] = ckptReq;
+  }
+
+  const newAllocVec = rids.map((r) => s.allocation[pid]?.[r] ?? 0);
+  const newReqVec   = rids.map((r) => s.request[pid]?.[r] ?? 0);
+
+  // No-op check: compare before and after
+  const allocChanged = prevAllocVec.some((v, i) => v !== newAllocVec[i]);
+  const reqChanged   = prevReqVec.some((v, i) => v !== newReqVec[i]);
+
+  if (!allocChanged && !reqChanged) {
+    return {
+      ok: false,
+      error: `Rolling back ${pid} changes nothing: it already matches the checkpoint. Pick another process or checkpoint.`,
+    };
+  }
+
+  // Build detailed change description
+  const prevAllocStr = "[" + prevAllocVec.join(", ") + "]";
+  const newAllocStr  = "[" + newAllocVec.join(", ") + "]";
+  const prevReqStr   = "[" + prevReqVec.join(", ") + "]";
+  const newReqStr    = "[" + newReqVec.join(", ") + "]";
+
+  const released = {};
+  for (let i = 0; i < rids.length; i++) {
+    released[rids[i]] = prevAllocVec[i] - newAllocVec[i];
+  }
+  const releasedStr  = "[" + rids.map((r) => released[r]).join(", ") + "]";
+
+  const newAvail    = computeAvailable(s);
+  const availStr    = fmtVec(newAvail, rids);
+
+  if (allocChanged) details.push(`${pid} allocation ${prevAllocStr} → ${newAllocStr}, released ${releasedStr}.`);
+  if (reqChanged)   details.push(`${pid} request ${prevReqStr} → ${newReqStr}.`);
+  details.push(`Available now ${availStr}.`);
+  if (mode === "restart") details.push(`${pid} in restart mode: all allocations zeroed; request restored from checkpoint.`);
+
+  const summary = `${pid} allocation ${prevAllocStr} → ${newAllocStr}, request ${prevReqStr} → ${newReqStr}, released ${releasedStr}, Available now ${availStr}.`;
 
   return {
+    ok: true,
     newState: s,
-    summary: `${pid} rolled back to checkpoint state. Available: ${availStr}.`,
+    summary,
     details,
     warnings,
   };
